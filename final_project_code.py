@@ -14,44 +14,12 @@ class Trajectory():
         # change tip/world
         self.chain = KinematicChain(node, 'pelvis', 'r_foot', self.intermediate_joints())
         
-        """
-        self.q0 = np.array([0.0, 0.0, 0.0, 
-                   
-                   0.0, 0.0, 0.0, 0.0, 
-                   0.0, 0.0, 0.0, 
-
-                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-                   
-                   0.0, 
-
-                   0.0, 0.0, 0.0, 0.0, 
-                   0.0, 0.0, 0.0, 
-                   
-                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).reshape(-1, 1)
-        """
+        self.q0 = np.array([0.0, 0.0, -0.312, 0.678, -0.366, 0.0]).reshape(-1, 1)
         
-        self.q0 = np.zeros((6,1))
-        
-        self.p0 = np.array([0.00015731, -0.1115, -0.86201]).reshape(-1, 1)
-        # self.R0 = Reye()
-
-        # self.q_final = np.array([0.0, 0.0, 0.0, 
-                        
-        #                0.0, 0.0, 0.0, 0.0, 
-        #                0.0, 0.0, 0.0, 
-
-        #                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-
-        #                0.0, 
-
-        #                0.0, 0.0, 0.0, 0.0, 
-        #                0.0, 0.0, 0.0, 
-                   
-        #                0.0, 0.0, 0.0, -1.612, 0.0, 1.612]).reshape(-1, 1)
-        self.p_final = np.array([0.4257, -0.11154, -0.52242]).reshape(-1, 1)
+        self.p0 = np.array([-0.034242, -0.1115, -0.83125]).reshape(-1, 1)
+        self.p_final = np.array([0.40741, -0.11154, -0.52203]).reshape(-1, 1)
 
         self.q = self.q0
-        # self.x = self.p0
         self.lam = 20
 
     def jointnames(self):
@@ -60,7 +28,7 @@ class Trajectory():
                 'l_arm_elx', 'l_arm_ely', 'l_arm_shx', 'l_arm_shz',
                 'l_arm_wrx', 'l_arm_wry', 'l_arm_wry2', 
 
-                'l_leg_akx', 'l_leg_aky', 'l_leg_hpx', 'l_leg_hpy', 'l_leg_hpz', 'l_leg_kny',
+                'l_leg_hpz', 'l_leg_hpx', 'l_leg_hpy', 'l_leg_kny', 'l_leg_aky',  'l_leg_akx',
 
                 'neck_ry',
 
@@ -95,37 +63,20 @@ class Trajectory():
 
         # Because it is singular, it's losing a DOF --> use secondary task to pull knee forward
 
-        # FIX
-        qdot_6 = J_pinv @ (v + self.lam * e)
-        q_6 = self.q + dt * qdot_6
+        qdot_r_leg = J_pinv @ (v + self.lam * e)
+        q_r_leg = self.q + dt * qdot_r_leg
 
-        # print(f"qdot_6 Length: {np.shape(qdot_6)}")
-        # print(f"q_6 Length: {np.shape(q_6)}")
-
-        # FIX
         qdot_full = np.zeros((24,1))
-        q_full = np.zeros((24, 1))
+        qdot = np.vstack((qdot_full, qdot_r_leg))
 
-        # print(f"qdot_full Length: {np.shape(qdot_full)}")
-        # print(f"q_full Length: {np.shape(q_full)}")
+        q_before_l_leg = np.zeros((10,1))
+        q_between_l_r_legs = np.zeros((8,1))
+
+        q_first_half = np.vstack((q_before_l_leg, self.q0))
+        q_second_half = np.vstack((q_between_l_r_legs, q_r_leg))
+        q = np.vstack((q_first_half, q_second_half))
         
-        #qdot_full = np.zeros((30,1))
-        #q_full = np.zeros((30, 1))
-        
-        #qdot_full[24:30, 0] = qdot_6
-        #q_full[24:30, 0] = q_6
-
-        qdot = np.vstack((qdot_full, qdot_6))
-        q = np.vstack((q_full, q_6))
-
-        # print(f"qdot Length: {np.shape(qdot)}")
-        # print(f"q Length: {np.shape(q)}")
-
-        # print(f"jointnames Length: {len(self.jointnames())}")
-        # print(f"q list Length: {len(q.flatten().tolist())}")
-        # print(f"qdot list Length: {qdot.flatten().tolist()}")
-        
-        self.q = q_6
+        self.q = q_r_leg
         
         return (q.flatten().tolist(), qdot.flatten().tolist())
         
