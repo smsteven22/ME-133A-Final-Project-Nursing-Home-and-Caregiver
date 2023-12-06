@@ -12,12 +12,16 @@ from hw5code.KinematicChain     import KinematicChain
 class Trajectory():
     def __init__(self, node):
         # change tip/world
-        self.chain = KinematicChain(node, 'pelvis', 'r_foot', self.intermediate_joints())
+        self.right_leg_chain = KinematicChain(node, 'pelvis', 'r_foot', self.right_leg_intermediate_joints())
+        self.left_leg_chain = KinematicChain(node, 'pelvis', 'l_foot', self.left_leg_intermediate_joints())
         
         self.q0 = np.array([0.0, 0.0, -0.312, 0.678, -0.366, 0.0]).reshape(-1, 1)
         
-        self.p0 = np.array([-0.034242, -0.1115, -0.83125]).reshape(-1, 1)
-        self.p_final = np.array([0.40741, -0.11154, -0.52203]).reshape(-1, 1)
+        # self.p0 = np.array([-0.034242, -0.1115, -0.83125]).reshape(-1, 1) # W.R.T Pelvis
+        # self.p_final = np.array([0.40741, -0.11154, -0.52203]).reshape(-1, 1) # W.R.T Pelvis
+
+        self.p0 = np.array([-0.0000010414, -0.233, -0.00000000015678]).reshape(-1, 1) # W.R.T l_foot
+        self.p_final = np.array([0.4628, -0.22304, 0.30902]).reshape(-1, 1) # W.R.T l_foot
 
         self.q = self.q0
         self.lam = 20
@@ -38,8 +42,11 @@ class Trajectory():
                 'r_leg_hpz', 'r_leg_hpx', 'r_leg_hpy', 'r_leg_kny', 'r_leg_aky',  'r_leg_akx'
              ]
 
-    def intermediate_joints(self):
+    def right_leg_intermediate_joints(self):
         return ['r_leg_hpz', 'r_leg_hpx', 'r_leg_hpy', 'r_leg_kny', 'r_leg_aky',  'r_leg_akx']
+    
+    def left_leg_intermediate_joints(self):
+        return ['l_leg_hpz', 'l_leg_hpx', 'l_leg_hpy', 'l_leg_kny', 'l_leg_aky',  'l_leg_akx']
         
     
     def evaluate(self, t, dt):
@@ -54,11 +61,16 @@ class Trajectory():
         wd = np.array([0, 0, 0]).reshape(-1, 1)
         
         qlast = self.q
-        (p, R, Jv, Jw) = self.chain.fkin(qlast)
+        (p_right, R_right, Jv_right, Jw_right) = self.right_leg_chain.fkin(qlast)
+        (p_left, R_left, Jv_left, Jw_left) = self.left_leg_chain.fkin(self.q0)
 
-        J = np.vstack((Jv, Jw))
+        # (p, R, Jv, Jw) = self.right_leg_chain.fkin(qlast)
+
+        p = (-1 * (np.transpose(R_left) @ p_left)) + (np.transpose(R_left) @ p_right)
+
+        J = np.vstack((Jv_right, Jw_right))
         v = np.vstack((vd, wd))
-        e = np.vstack((ep(pd, p), eR(Rd, R)))
+        e = np.vstack((ep(pd, p), eR(Rd, R_right)))
         J_pinv = np.linalg.pinv(J)
 
         # Because it is singular, it's losing a DOF --> use secondary task to pull knee forward
