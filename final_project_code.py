@@ -1,32 +1,186 @@
 import rclpy
 import numpy as np
 
-from math import *
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.time import Duration
 
-from hw5code.GeneratorNode      import GeneratorNode
-from hw5code.TransformHelpers   import *
-from hw5code.TrajectoryUtils    import *
+from geometry_msgs.msg import Point, Vector3, Quaternion
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker
+from visualization_msgs.msg import MarkerArray
+from sensor_msgs.msg import JointState
 
-from hw5code.KinematicChain     import KinematicChain
+from asyncio import Future
+
+from hw5code.TransformHelpers import *
+from hw5code.TrajectoryUtils import *
+from hw5code.KinematicChain import KinematicChain
+
+class SoccerNode(Node):
+    # Initialization
+    def __init__(self, name, rate, Trajectory):
+        # Initialize the node, naming it as specified
+        super().__init__(name)
+
+        # Set up a trajectory.
+        self.trajectory = Trajectory(self)
+        self.jointnames = self.trajectory.jointnames()
+
+        # Add a publisher to send the joint commands.
+        self.pub_joint = self.create_publisher(JointState, '/joint_states', 10)
+
+        # Prepare the marker publisher (latching for new subscribers)
+        quality = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
+        self.pub_marker = self.create_publisher(MarkerArray, '/visualization_marker_array', quality)
+
+        # Initialize the ball position, velocity, set the acceleration.
+        self.radius = 0.1
+
+        self.aball = np.array([0.0, 0.0, -9.81]).reshape((3,1))
+        self.vball = np.array([-15.0, 0.0,  14.62]).reshape((3,1))
+        self.pball = np.array([self.vball[0,0] * -3, self.trajectory.p0[1,0], 0.0]).reshape((3,1))
+
+        # Manual ball kinematic equations to generate pkick
+        self.pkick = np.array([self.pball[0,0] - (3 * self.vball[0,0]), self.pball[1,0],  0.0]).reshape((3,1))
+        nobouncedeltaz = (self.vball[2,0] * 3) - (0.5 * self.aball[2,0] * (3 ^ 2))
+        if -nobouncedeltaz <= self.pball[2,0]:
+            self.pkick[2,0] = self.pball[2,0] + nobouncedeltaz 
+        else:
+            # bounce1time eqn only holds for initial z position of 0
+            bounce1time = (-2 * self.vball[2,0]) / self.aball[2,0]
+            vbounce1 = self.vball[2,0] + (self.aball[2,0] * bounce1time)
+            vup1 = -vbounce1
+            zstatus1 = (vup1 * (3 - bounce1time)) + (0.5 * self.aball[2,0] * (3 - bounce1time))
+            self.pkick[2,0] = zstatus1
+
+        self.trajectory.p_final = self.pkick
+        
+        # Create the sphere marker.
+        diam = 2 * self.radius
+        self.marker = Marker()
+        self.marker.header.frame_id = "l_foot"
+        self.marker.header.stamp = self.get_clock().now().to_msg()
+        self.marker.action = Marker.ADD
+        self.marker.ns = "point"
+        self.marker.id = 1
+        self.marker.type = Marker.SPHERE
+        self.marker.pose.orientation = Quaternion()
+        self.marker.pose.position = Point_from_p(self.pball)
+        self.marker.scale = Vector3(x=diam, y=diam, z=diam)
+        self.marker.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=1.0)
+
+        # Create the marker array Message.
+        self.mark = MarkerArray()
+        self.mark.markers.append(self.marker)
+
+        # Create a future object to signal when the trajectory ends,
+        # i.e. no longer returns useful data.
+        self.future = Future()
+
+        # Set up the timing so (t=0) will occur in the first update
+        # cycle (dt) from now.
+        self.dt = 1.0 / float(rate)
+        self.t = -self.dt
+        self.start = self.get_clock().now() + Duration(seconds=self.dt)
+
+        # Create a timer to keep calculating/sending commands.
+        self.timer = self.create_timer(self.dt, self.update)
+        self.get_logger().info("Running with dt of %f seconds (%fHz)" % (self.dt, rate))
+
+    # Shutdown
+    def shutdown(self):
+        # Destroy the timer, then shut down the node.
+        self.timer.destroy()
+        self.destroy_node()
+
+    # Spin
+    def spin(self):
+        # Keep running (taking care of the timer callbacks and message 
+        # passing), until interrupted or the trajectory is complete
+        # (as signaled by the future object).
+        rclpy.spin_until_future_complete(self, self.future)
+
+        # Report the reason for shutting down.
+        if self.future.done():
+            self.get_logger().info("Stopping: " + self.future.result())
+        else:
+            self.get_logger().info("Stopping: Interrupted")
+
+    # Update - send a new joint command every time step.
+    def update(self):
+        # To avoid any time jitter enforce a constant time step and
+        # integrate to get the current time.
+        self.t += self.dt
+
+        # Integrate the velocity, then the position.
+        self.vball += self.dt * self.aball
+        self.pball += self.dt * self.vball
+
+        # Check for the ground
+        if self.pball[2, 0] < self.radius:
+            self.pball[2,0] = self.radius + (self.radius - self.pball[2,0])
+            self.vball[2,0] *= -1.0
+
+        # Check for right foot
+        if (abs(self.pball[0,0] - self.trajectory.p_right[0,0]) < (2 * self.radius)) and (abs(self.pball[1,0] - self.trajectory.p_right[1,0]) < (2 * self.radius)) and (abs(self.pball[2,0] - self.trajectory.p_right[2,0]) < (2 * self.radius)):
+            self.pball[0,0] = self.radius + (self.radius - self.pball[0,0])
+            self.vball[0,0] *= -1.0
+
+        # Determine the corresponding ROS time (seconds since 1970).
+        now = self.start + Duration(seconds=self.t)
+
+        # Compute the desired joint positions and velocities for this time.
+        desired = self.trajectory.evaluate(self.t, self.dt)
+        if desired is None:
+            self.future.set_result("Trajectory has ended")
+            return
+        (q, qdot) = desired
+
+        # Check the results.
+        if not (isinstance(q, list) and isinstance(qdot, list )):
+            self.get_logger().warn("(q) and (qdot) must be python lists!")
+            return
+        if not (len(q) == len(self.jointnames)):
+            self.get_logger().warn("(q) must be same length as jointnames!")
+            return
+        if not (len(qdot) == len(q)):
+            self.get_logger().warn("(qdot) must be same length as (q)!")
+            return
+        if not (isinstance(q[0], float) and isinstance(qdot[0], float)):
+            self.get_logger().warn("Flatten NumPy arrays before makiing lists!")
+            return
+        
+        # Build up a joint command message and publish.
+        cmdmsg = JointState()
+        cmdmsg.header.stamp = now.to_msg() # Current time for ROS
+        cmdmsg.name = self.jointnames # List of joint names
+        cmdmsg.position = q # List of joint positions
+        cmdmsg.velocity = qdot # List of joint velocities
+        self.pub_joint.publish(cmdmsg)
+
+        # Update the marker message and publish.
+        self.marker.header.stamp = now.to_msg()
+        self.marker.pose.position = Point_from_p(self.pball)
+        self.pub_marker.publish(self.mark)
 
 class Trajectory():
     def __init__(self, node):
         self.right_leg_chain = KinematicChain(node, 'pelvis', 'r_foot', self.right_leg_intermediate_joints())
         self.left_leg_chain = KinematicChain(node, 'pelvis', 'l_foot', self.left_leg_intermediate_joints())
         
-        # self.q0 = np.array([0.0, 0.0, -0.312, 0.678, -0.366, 0.0, 0.0, 0.0, -0.312, 0.678, -0.366, 0.0]).reshape(-1, 1) # Shallow squat
-        self.q0 = np.array([0.0, 0.0, -1.126, 1.630, -0.504, 0.0, 0.0, 0.0, -1.126, 1.630, -0.504, 0.0]).reshape(-1, 1) # Deep squat
+        self.q0 = np.array([0.0, 0.0, -0.312, 0.678, -0.366, 0.0, 0.0, 0.0, -0.312, 0.678, -0.366, 0.0]).reshape(-1, 1) # Shallow squat
+        # self.q0 = np.array([0.0, 0.0, -1.126, 1.630, -0.504, 0.0, 0.0, 0.0, -1.126, 1.630, -0.504, 0.0]).reshape(-1, 1) # Deep squat
         self.qdot_max = np.array([1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
 
         # self.p0 = np.array([-0.034242, -0.1115, -0.83125]).reshape(-1, 1) # W.R.T Pelvis
         # self.p_final = np.array([0.40741, -0.11154, -0.52203]).reshape(-1, 1) # W.R.T Pelvis
 
-        # self.p0 = np.array([-0.0000010414, -0.233, -0.00000000015678, 0.0, 0.0, 0.0]).reshape(-1, 1) # Shallow squat W.R.T l_foot
-        self.p0 = np.array([-0.0000010421, -0.22301, -0.00000000027629]).reshape(-1, 1) # Deep squat W.R.T l_foot
+        self.p0 = np.array([-0.0000010414, -0.233, -0.00000000015678]).reshape(-1, 1) # Shallow squat W.R.T l_foot
+        # self.p0 = np.array([-0.0000010421, -0.22301, -0.00000000027629]).reshape(-1, 1) # Deep squat W.R.T l_foot
         self.p_final = np.array([0.4628, -0.22304, 0.30902]).reshape(-1, 1) # W.R.T l_foot
 
-        
-
+        self.p_right = self.p0
         self.q = self.q0
         self.lam = 20
 
@@ -52,7 +206,6 @@ class Trajectory():
     def left_leg_intermediate_joints(self):
         return ['l_leg_hpz', 'l_leg_hpx', 'l_leg_hpy', 'l_leg_kny', 'l_leg_aky',  'l_leg_akx']
         
-    
     def evaluate(self, t, dt):
         t_mod = t % 6
 
@@ -77,6 +230,7 @@ class Trajectory():
         (p_left, R_left, Jv_left, Jw_left) = self.left_leg_chain.fkin(qlast_left)
 
         new_p_right = (-1 * (np.transpose(R_left) @ p_left)) + (np.transpose(R_left) @ p_right)
+        self.p_right = new_p_right
 
         J_right = np.vstack((Jv_right, Jw_right))
         v_right = np.vstack((vd, wd))
@@ -113,26 +267,24 @@ class Trajectory():
         self.q = np.vstack((q_right, q_left))
         
         return (q.flatten().tolist(), qdot.flatten().tolist())
-        
-            
-
+    
 #
-#  Main Code
+# Main Code
 #
 def main(args=None):
     # Initialize ROS.
     rclpy.init(args=args)
 
-    # Initialize the generator node for 100Hz udpates, using the above
+    # Initialize the soccer node for 100Hz updates, using the above
     # Trajectory class.
-    generator = GeneratorNode('generator', 100, Trajectory)
+    soccer = SoccerNode('soccer', 100, Trajectory)
 
     # Spin, meaning keep running (taking care of the timer callbacks
     # and message passing), until interrupted or the trajectory ends.
-    generator.spin()
+    soccer.spin()
 
-    # Shutdown the node and ROS.
-    generator.shutdown()
+    # Shudown the node and ROS.
+    soccer.shutdown()
     rclpy.shutdown()
 
 if __name__ == "__main__":
