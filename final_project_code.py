@@ -31,28 +31,30 @@ class SoccerNode(Node):
         self.pub_joint = self.create_publisher(JointState, '/joint_states', 10)
 
         # Prepare the marker publisher (latching for new subscribers)
-        quality = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
+        quality = QoSProfile(durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=20)
         self.pub_marker = self.create_publisher(MarkerArray, '/visualization_marker_array', quality)
 
         # Initialize the ball position, velocity, set the acceleration.
         self.radius = 0.1
 
         self.aball = np.array([0.0, 0.0, -9.81]).reshape((3,1))
-        self.vball = np.array([-15.0, 0.0,  14.62]).reshape((3,1))
-        self.pball = np.array([self.vball[0,0] * -3, self.trajectory.p0[1,0], 0.0]).reshape((3,1))
+        # robot can only handle initial ball z velocities of approx 0 < v_z_0 < 3.7 (meters per second)
+        # visualizer handles better if restricted to 0 < v_z_0 < 2 (meters per second) and -2 < v_x_0 < 0 
+        self.vball = np.array([-2.0, 0.0,  2]).reshape((3,1))
+        # robot can only handle xforward of approx 0 < xforward < 0.7
+        xforward = 0.4
+        self.pball = np.array([xforward + (self.vball[0,0] * -3), self.trajectory.p0[1,0], self.radius]).reshape((3,1))
 
         # Manual ball kinematic equations to generate pkick
-        self.pkick = np.array([self.pball[0,0] - (3 * self.vball[0,0]), self.pball[1,0],  0.0]).reshape((3,1))
-        nobouncedeltaz = (self.vball[2,0] * 3) - (0.5 * self.aball[2,0] * (3 ^ 2))
-        if -nobouncedeltaz <= self.pball[2,0]:
-            self.pkick[2,0] = self.pball[2,0] + nobouncedeltaz 
-        else:
-            # bounce1time eqn only holds for initial z position of 0
-            bounce1time = (-2 * self.vball[2,0]) / self.aball[2,0]
-            vbounce1 = self.vball[2,0] + (self.aball[2,0] * bounce1time)
-            vup1 = -vbounce1
-            zstatus1 = (vup1 * (3 - bounce1time)) + (0.5 * self.aball[2,0] * (3 - bounce1time))
-            self.pkick[2,0] = zstatus1
+        self.pkick = np.array([self.pball[0,0] + (3 * self.vball[0,0]), self.pball[1,0],  0.0]).reshape((3,1))
+
+        # velocity slowdown (and frankly more robust) re-approach to finding pkick
+        # only holds for initial ball position of z = 0:
+        ttokick = 3
+        bouncetime = (-2 * self.vball[2,0]) / self.aball[2,0]
+        tlast = ttokick % bouncetime
+        zkick = (self.vball[2,0] * tlast) + (0.5 * self.aball[2,0] * (tlast**2))
+        self.pkick[2,0] = zkick
 
         self.trajectory.p_final = self.pkick
         
@@ -116,16 +118,17 @@ class SoccerNode(Node):
         # Integrate the velocity, then the position.
         self.vball += self.dt * self.aball
         self.pball += self.dt * self.vball
-
-        # Check for the ground
-        if self.pball[2, 0] < self.radius:
+        
+        # Check for right foot
+        if (abs(self.pball[0,0] - self.trajectory.p_right[0,0]) < (self.radius)) and (abs(self.pball[1,0] - self.trajectory.p_right[1,0]) < (self.radius)) and (abs(self.pball[2,0] - self.trajectory.p_right[2,0]) < (self.radius)):
+            # self.pball[0,0] = self.radius + (self.radius - self.pball[0,0])
+            self.pball[0,0] = (self.pball[0,0]) + self.radius
+            self.vball[0,0] *= -1.0
+        elif self.pball[2, 0] < self.radius:
+            # Check for the ground
+            # important lines, do not delete or comment out
             self.pball[2,0] = self.radius + (self.radius - self.pball[2,0])
             self.vball[2,0] *= -1.0
-
-        # Check for right foot
-        if (abs(self.pball[0,0] - self.trajectory.p_right[0,0]) < (2 * self.radius)) and (abs(self.pball[1,0] - self.trajectory.p_right[1,0]) < (2 * self.radius)) and (abs(self.pball[2,0] - self.trajectory.p_right[2,0]) < (2 * self.radius)):
-            self.pball[0,0] = self.radius + (self.radius - self.pball[0,0])
-            self.vball[0,0] *= -1.0
 
         # Determine the corresponding ROS time (seconds since 1970).
         now = self.start + Duration(seconds=self.t)
@@ -144,7 +147,7 @@ class SoccerNode(Node):
         if not (len(q) == len(self.jointnames)):
             self.get_logger().warn("(q) must be same length as jointnames!")
             return
-        if not (len(qdot) == len(q)):
+        if not (len(qdot) == len(self.jointnames)):
             self.get_logger().warn("(qdot) must be same length as (q)!")
             return
         if not (isinstance(q[0], float) and isinstance(qdot[0], float)):
@@ -160,6 +163,8 @@ class SoccerNode(Node):
         self.pub_joint.publish(cmdmsg)
 
         # Update the marker message and publish.
+        # Increment marker id to show path of the ball:
+        # self.marker.id += 1
         self.marker.header.stamp = now.to_msg()
         self.marker.pose.position = Point_from_p(self.pball)
         self.pub_marker.publish(self.mark)
@@ -169,17 +174,25 @@ class Trajectory():
         self.right_leg_chain = KinematicChain(node, 'pelvis', 'r_foot', self.right_leg_intermediate_joints())
         self.left_leg_chain = KinematicChain(node, 'pelvis', 'l_foot', self.left_leg_intermediate_joints())
         
-        self.q0 = np.array([0.0, 0.0, -0.312, 0.678, -0.366, 0.0, 0.0, 0.0, -0.312, 0.678, -0.366, 0.0]).reshape(-1, 1) # Shallow squat
-        # self.q0 = np.array([0.0, 0.0, -1.126, 1.630, -0.504, 0.0, 0.0, 0.0, -1.126, 1.630, -0.504, 0.0]).reshape(-1, 1) # Deep squat
-        self.qdot_max = np.array([1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
-
-        # self.p0 = np.array([-0.034242, -0.1115, -0.83125]).reshape(-1, 1) # W.R.T Pelvis
-        # self.p_final = np.array([0.40741, -0.11154, -0.52203]).reshape(-1, 1) # W.R.T Pelvis
+        """ 
+        self.q0 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+                            0.0, 0.0, -0.312, 0.678, -0.366, 0.0, 
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+                            0.0, 0.0, -0.312, 0.678, -0.366, 0.0]).reshape(-1, 1) # Shallow squat
+        """
+        self.q0 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+                            0.0, 0.0, -1.126, 1.630, -0.504, 0.0, 
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
+                            0.0, 0.0, -1.126, 1.630, -0.504, 0.0]).reshape(-1, 1) # Deep squat
+        self.qdot_max = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
+                                  0, 0, 0, 0, 0, 0, 
+                                  0, 0, 0, 0, 0, 0, 0, 0, 
+                                  1, 1, 1, 1, 1, 1])
 
         self.p0 = np.array([-0.0000010414, -0.233, -0.00000000015678]).reshape(-1, 1) # Shallow squat W.R.T l_foot
         # self.p0 = np.array([-0.0000010421, -0.22301, -0.00000000027629]).reshape(-1, 1) # Deep squat W.R.T l_foot
         self.p_final = np.array([0.4628, -0.22304, 0.30902]).reshape(-1, 1) # W.R.T l_foot
-
+        
         self.p_right = self.p0
         self.q = self.q0
         self.lam = 20
@@ -206,6 +219,7 @@ class Trajectory():
     def left_leg_intermediate_joints(self):
         return ['l_leg_hpz', 'l_leg_hpx', 'l_leg_hpy', 'l_leg_kny', 'l_leg_aky',  'l_leg_akx']
         
+    
     def evaluate(self, t, dt):
         t_mod = t % 6
 
@@ -214,57 +228,55 @@ class Trajectory():
         else:
             (pd, vd) = goto(t_mod-3.0, 3.0, self.p_final, self.p0)  
 
+        # End after one cycle.
+        if t > 6:
+            return None
+
         Rd = Reye()
         wd = np.zeros((3,1))
 
-        qlast_right = (self.q[0:6, 0]).reshape(-1,1)
-        qlast_left = (self.q[6:, 0]).reshape(-1, 1)
-
-        qdot_max_right = self.qdot_max[0:6]
-        qdot_max_left = self.qdot_max[6:]
-
-        qdot_max_right_diag = np.diag(qdot_max_right)
-        qdot_max_left_diag = np.diag(qdot_max_left)
+        qlast_left = (self.q[10:16, 0]).reshape(-1,1)
+        qlast_right = (self.q[24:, 0]).reshape(-1, 1)
+        
+        qdot_max_diag = np.diag(self.qdot_max)
 
         (p_right, R_right, Jv_right, Jw_right) = self.right_leg_chain.fkin(qlast_right)
         (p_left, R_left, Jv_left, Jw_left) = self.left_leg_chain.fkin(qlast_left)
 
-        new_p_right = (-1 * (np.transpose(R_left) @ p_left)) + (np.transpose(R_left) @ p_right)
-        self.p_right = new_p_right
+        p_rl = np.transpose(R_left) @ (p_right - p_left)
+        R_rl = np.transpose(R_left) @ R_right
 
-        J_right = np.vstack((Jv_right, Jw_right))
-        v_right = np.vstack((vd, wd))
-        e_right = np.vstack((ep(pd, new_p_right), eR(Rd, R_right)))
-        J_pinv_right = np.linalg.pinv(J_right @ qdot_max_right_diag)
+        self.p_right = p_rl
 
-        qdot_right = qdot_max_right_diag @ J_pinv_right @ (v_right + self.lam * e_right)
-        q_right = qlast_right + dt * qdot_right
+        def indexlist(start, num): return list(range(start, start+num))
+        i_left = indexlist(10, 6)
+        i_right = indexlist(24, 6)
+        J_half = np.zeros((3,30))
 
-        J_left = np.vstack((Jv_left, Jw_left))
-        v_left = np.vstack((vd, wd))
-        e_left = np.vstack((ep(pd, p_left), eR(Rd, R_left)))
-        J_pinv_left = np.linalg.pinv(J_left @ qdot_max_left_diag)
+        Jv_bar_left = J_half.copy()
+        Jv_bar_left[:, i_left] = Jv_left
 
-        qdot_left = qdot_max_left_diag @ J_pinv_left @ (v_left + self.lam * e_left)
-        q_left = qlast_left + dt * qdot_left
+        Jw_bar_left = J_half.copy()
+        Jw_bar_left[:, i_left] = Jw_left
 
-        qdot_before_left = np.zeros((10, 1))
-        qdot_between_left_right = np.zeros((8,1))
+        Jv_bar_right = J_half.copy()
+        Jv_bar_right[:, i_right] = Jv_right
 
-        qdot_first_half = np.vstack((qdot_before_left, qdot_left))
-        qdot_second_half = np.vstack((qdot_between_left_right, qdot_right))
-        qdot = np.vstack((qdot_first_half, qdot_second_half))
+        Jw_bar_right = J_half.copy()
+        Jw_bar_right[:, i_right] = Jw_right
 
-        q_before_left = np.zeros((10, 1))
-        q_between_left_right = np.zeros((8, 1))
+        Jv_rl = np.transpose(R_left) @ (Jv_bar_right - Jv_bar_left + (crossmat(p_right - p_left) @ Jw_bar_left))
+        Jw_rl = np.transpose(R_left) @ (Jw_bar_right - Jw_bar_left)
 
-        q_first_half = np.vstack((q_before_left, q_left))
-        q_second_half = np.vstack((q_between_left_right, q_right))
-        q = np.vstack((q_first_half, q_second_half))
+        J_rl = np.vstack((Jv_rl, Jw_rl))
+        v_rl = np.vstack((vd, wd))
+        e_rl = np.vstack((ep(pd, p_rl), eR(Rd, R_rl)))
+        J_rl_pinv = np.linalg.pinv(J_rl @ qdot_max_diag)
 
-        # Because it is singular, it's losing a DOF --> use secondary task to pull knee forward
+        qdot = qdot_max_diag @ J_rl_pinv @ (v_rl + self.lam * e_rl)
+        q = self.q + dt * qdot
 
-        self.q = np.vstack((q_right, q_left))
+        self.q = q
         
         return (q.flatten().tolist(), qdot.flatten().tolist())
     
